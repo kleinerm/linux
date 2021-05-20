@@ -297,6 +297,13 @@ struct drm_crtc_state {
 	u32 target_vblank;
 
 	/**
+	 * target_time_nsec:
+	 *
+	 * Target CLOCK_MONOTONIC time when a page flip should take effect.
+	 */
+	u64 target_time_nsec;
+
+	/**
 	 * @async_flip:
 	 *
 	 * This is set when DRM_MODE_PAGE_FLIP_ASYNC is set in the legacy

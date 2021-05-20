@@ -1220,14 +1220,20 @@ int drm_mode_page_flip_ioctl(struct drm_device *dev,
 	if (page_flip->sequence != 0 && !(page_flip->flags & DRM_MODE_PAGE_FLIP_TARGET))
 		return -EINVAL;
 
-	/* Only one of the DRM_MODE_PAGE_FLIP_TARGET_ABSOLUTE/RELATIVE flags
+	/* Only one of the DRM_MODE_PAGE_FLIP_TARGET_ABSOLUTE/RELATIVE/TIME flags
 	 * can be specified
 	 */
-	if ((page_flip->flags & DRM_MODE_PAGE_FLIP_TARGET) == DRM_MODE_PAGE_FLIP_TARGET)
+	if ((page_flip->flags & DRM_MODE_PAGE_FLIP_TARGET) && !(
+	    ((page_flip->flags & DRM_MODE_PAGE_FLIP_TARGET) == DRM_MODE_PAGE_FLIP_TARGET_ABSOLUTE) ||
+	    ((page_flip->flags & DRM_MODE_PAGE_FLIP_TARGET) == DRM_MODE_PAGE_FLIP_TARGET_RELATIVE) ||
+	    ((page_flip->flags & DRM_MODE_PAGE_FLIP_TARGET) == DRM_MODE_PAGE_FLIP_TARGET_TIME)))
 		return -EINVAL;
 
 	if ((page_flip->flags & DRM_MODE_PAGE_FLIP_ASYNC) && !dev->mode_config.async_page_flip)
 		return -EINVAL;
+
+	if ((page_flip->flags & DRM_MODE_PAGE_FLIP_TARGET_TIME) && !dev->mode_config.timed_page_flip)
+	    return -EOPNOTSUPP;
 
 	crtc = drm_crtc_find(dev, file_priv, page_flip->crtc_id);
 	if (!crtc)
@@ -1266,6 +1272,9 @@ int drm_mode_page_flip_ioctl(struct drm_device *dev,
 				return -EINVAL;
 			}
 			target_vblank += current_vblank;
+			break;
+		case DRM_MODE_PAGE_FLIP_TARGET_TIME:
+			/* Nothing to do or to validate. */
 			break;
 		default:
 			target_vblank = current_vblank +

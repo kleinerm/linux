@@ -906,6 +906,12 @@ struct drm_mode_config {
 	bool async_page_flip;
 
 	/**
+	 * timed_page_flip: Does this device support flips at a specified target
+	 * time, requested via flip flag DRM_MODE_PAGE_FLIP_TARGET_TIME?
+	 */
+	bool timed_page_flip;
+
+	/**
 	 * @allow_fb_modifiers:
 	 *
 	 * Whether the driver supports fb modifiers in the ADDFB2.1 ioctl call.

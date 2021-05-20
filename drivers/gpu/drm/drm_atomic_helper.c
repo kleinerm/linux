@@ -3448,6 +3448,7 @@ int drm_atomic_helper_page_flip_target(struct drm_crtc *crtc,
 	struct drm_plane *plane = crtc->primary;
 	struct drm_atomic_state *state;
 	struct drm_crtc_state *crtc_state;
+	u64 ref_usec, target_usec;
 	int ret = 0;
 
 	state = drm_atomic_state_alloc(plane->dev);
@@ -3465,7 +3466,29 @@ int drm_atomic_helper_page_flip_target(struct drm_crtc *crtc,
 		ret = -EINVAL;
 		goto fail;
 	}
-	crtc_state->target_vblank = target;
+
+	if (flags & DRM_MODE_PAGE_FLIP_TARGET_TIME) {
+		crtc_state->target_vblank = 0;
+
+		/*
+		 * Reconstruct full 64 bits target usecs from passed in lower
+		 * 32 bits of usecs target time. We assume that target time
+		 * will not be more than 10 minutes in the past.
+		 */
+		ref_usec = (u64) ktime_to_us(ktime_get());
+		target_usec = (ref_usec & 0xFFFFFFFF00000000ULL) | target;
+		if ((s64) target_usec < (s64) ref_usec - 600000000) {
+		    /* More than 10 minutes early: Bump to next 32-bit epoch. */
+		    target_usec += 0x100000000ULL;
+		}
+
+		crtc_state->target_time_nsec = target_usec * NSEC_PER_USEC;
+		DRM_DEBUG_ATOMIC("Flip target time is %llu nsecs.\n",
+			 crtc_state->target_time_nsec);
+	} else {
+		crtc_state->target_vblank = target;
+		crtc_state->target_time_nsec = 0;
+	}
 
 	ret = drm_atomic_nonblocking_commit(state);
 fail:
