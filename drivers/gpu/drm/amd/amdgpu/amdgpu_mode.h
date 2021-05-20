@@ -432,6 +432,9 @@ struct amdgpu_crtc {
 
 	int otg_inst;
 	struct drm_pending_vblank_event *event;
+
+	s64 target_flip_onset;
+	s64 last_target_flip_onset;
 };
 
 struct amdgpu_encoder_atom_dig {

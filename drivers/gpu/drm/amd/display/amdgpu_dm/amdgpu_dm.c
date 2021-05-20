@@ -350,6 +350,21 @@ static inline bool is_dc_timing_adjust_needed(struct dm_crtc_state *old_state,
 		return false;
 }
 
+/* Return true if current scanout position is inside front porch, false otherwise. */
+static bool exp_scanout_in_frontporch(struct amdgpu_crtc *acrtc, struct mod_vrr_params *vrr_params)
+{
+	uint32_t v_blank_start, v_blank_end, hpos, vpos;
+
+	dc_stream_get_scanoutpos(acrtc->dm_irq_params.stream, &v_blank_start,
+				 &v_blank_end, &hpos, &vpos);
+
+	DRM_INFO("Flip target - DRR prog at %d [fp %d] vs. [%d ; %d] %s\n", vpos,
+		 (int) (vpos >= v_blank_start), vrr_params->adjust.v_total_min,
+		 vrr_params->adjust.v_total_max, (vrr_params->adjust.v_total_max < vpos) ? "!!!" : "");
+
+	return vpos >= v_blank_start;
+}
+
 /**
  * dm_pflip_high_irq() - Handle pageflip interrupt
  * @interrupt_params: ignored
@@ -447,6 +462,31 @@ static void dm_pflip_high_irq(void *interrupt_params)
 		amdgpu_get_vblank_counter_kms(&amdgpu_crtc->base);
 
 	amdgpu_crtc->pflip_status = AMDGPU_FLIP_NONE;
+
+	if (vrr_active) {
+		/* Debug diagnostic: */
+		if (true) {
+			amdgpu_crtc->last_target_flip_onset = amdgpu_crtc->target_flip_onset;
+
+			if (e) {
+				ktime_t predonset;
+				s64 actual_flip_onset;
+				drm_crtc_vblank_count_and_time(&amdgpu_crtc->base, &predonset);
+				actual_flip_onset = ktime_to_ns(predonset);
+
+				DRM_INFO("Flip target - FLIP ONSET: %lld ns delta %lld us. %s\n",
+					actual_flip_onset,
+					ktime_to_us(ns_to_ktime(actual_flip_onset - amdgpu_crtc->last_target_flip_onset)),
+					(actual_flip_onset < amdgpu_crtc->last_target_flip_onset - 300 * NSEC_PER_USEC) ? "!!!!" : "");
+			}
+
+			DRM_INFO("Flip target crtc:%d[%p], pflip_stat:AMDGPU_FLIP_NONE, vrr[%d]-fp %d\n",
+				amdgpu_crtc->crtc_id, amdgpu_crtc, vrr_active, (int) !e);
+		}
+
+		amdgpu_crtc->target_flip_onset = 0;
+	}
+
 	spin_unlock_irqrestore(&adev_to_drm(adev)->event_lock, flags);
 
 	DC_LOG_PFLIP("crtc:%d[%p], pflip_stat:AMDGPU_FLIP_NONE, vrr[%d]-fp %d\n",
@@ -494,19 +534,50 @@ static void dm_vupdate_high_irq(void *interrupt_params)
 		if (vrr_active) {
 			drm_crtc_handle_vblank(&acrtc->base);
 
+			/* Debug diagnostic */
+			if (true) {
+				ktime_t predonset;
+				uint32_t last_used_vtotal;
+
+				drm_crtc_vblank_count_and_time(&acrtc->base, &predonset);
+				if (dc_stream_get_last_used_drr_vtotal(adev->dm.dc, acrtc->dm_irq_params.stream, &last_used_vtotal)) {
+					DRM_INFO("Flip target - Would onset: %lld ns delta %lld us. Last used drr vtotal %d\n", ktime_to_ns(predonset), ktime_us_delta(predonset, previous_timestamp), last_used_vtotal);
+				}
+				else {
+					DRM_INFO("Flip target - Would onset: %lld ns delta %lld us.\n", ktime_to_ns(predonset), ktime_us_delta(predonset, previous_timestamp));
+				}
+
+				atomic64_set(&irq_params->previous_timestamp, predonset);
+			}
+
 			/* BTR processing for pre-DCE12 ASICs */
 			if (acrtc->dm_irq_params.stream &&
-			    adev->family < AMDGPU_FAMILY_AI) {
+			    (adev->family < AMDGPU_FAMILY_AI || true)) {
 				spin_lock_irqsave(&adev_to_drm(adev)->event_lock, flags);
 				mod_freesync_handle_v_update(
 				    adev->dm.freesync_module,
 				    acrtc->dm_irq_params.stream,
 				    &acrtc->dm_irq_params.vrr_params);
 
-				dc_stream_adjust_vmin_vmax(
-				    adev->dm.dc,
-				    acrtc->dm_irq_params.stream,
-				    &acrtc->dm_irq_params.vrr_params.adjust);
+				/*
+				 * Only program new setting into hw if no btr, conventional btr, or
+				 * the insertion sequence for a timed flip can be stopped now, as
+				 * the flip has already completed and scanout of flipped image will
+				 * now begin after end of this back porch.
+				 */
+				if (!acrtc->dm_irq_params.vrr_params.btr.btr_active ||
+				    acrtc->target_flip_onset == 0 ||
+				    acrtc->dm_irq_params.vrr_params.btr.frame_counter > 0) {
+					dc_stream_adjust_vmin_vmax(
+					    adev->dm.dc,
+					    acrtc->dm_irq_params.stream,
+					    &acrtc->dm_irq_params.vrr_params.adjust);
+					exp_scanout_in_frontporch(acrtc, &acrtc->dm_irq_params.vrr_params);
+				}
+				else {
+					DRM_INFO("Flip target - Keeping VRR settings one more frame.\n");
+				}
+
 				spin_unlock_irqrestore(&adev_to_drm(adev)->event_lock, flags);
 			}
 		}
@@ -559,6 +630,7 @@ static void dm_crtc_high_irq(void *interrupt_params)
 	spin_lock_irqsave(&adev_to_drm(adev)->event_lock, flags);
 
 	if (acrtc->dm_irq_params.stream &&
+	    false &&
 	    acrtc->dm_irq_params.vrr_params.supported &&
 	    acrtc->dm_irq_params.freesync_config.state ==
 		    VRR_STATE_ACTIVE_VARIABLE) {
@@ -3379,6 +3451,8 @@ static int amdgpu_dm_mode_config_init(struct amdgpu_device *adev)
 	adev_to_drm(adev)->mode_config.prefer_shadow = 1;
 	/* indicates support for immediate flip */
 	adev_to_drm(adev)->mode_config.async_page_flip = true;
+	/* Indicates support for timed flips in vrr mode. */
+	adev_to_drm(adev)->mode_config.timed_page_flip = true;
 
 	adev_to_drm(adev)->mode_config.fb_base = adev->gmc.aper_base;
 
@@ -6045,7 +6119,7 @@ static const struct drm_crtc_funcs amdgpu_dm_crtc_funcs = {
 	.reset = dm_crtc_reset_state,
 	.destroy = amdgpu_dm_crtc_destroy,
 	.set_config = drm_atomic_helper_set_config,
-	.page_flip = drm_atomic_helper_page_flip,
+	.page_flip_target = drm_atomic_helper_page_flip_target,
 	.atomic_duplicate_state = dm_crtc_duplicate_state,
 	.atomic_destroy_state = dm_crtc_destroy_state,
 	.set_crc_source = amdgpu_dm_crtc_set_crc_source,
@@ -8387,6 +8461,426 @@ static void amdgpu_dm_handle_vrr_transition(struct dm_crtc_state *old_state,
 	}
 }
 
+/*
+ * Extract target presentation onset time in nsec, if any. Clamp to be no more
+ * than 1 minute into the future. Invalidate the old drm_crtc_state
+ * target_time_nsec.
+ */
+static uint64_t exp_get_target_time(uint64_t *target_time_nsec)
+{
+	uint64_t target_ns = *target_time_nsec;
+	uint64_t maxtime_ns = ktime_get_ns() + 60 * NSEC_PER_SEC;
+
+	*target_time_nsec = 0;
+
+	/* Prevent accidental waits forever ~ greater 1 minute. */
+	if (target_ns > maxtime_ns)
+		target_ns = maxtime_ns;
+
+	if (target_ns > 0)
+		DRM_INFO("Flip target onset nsec: %lld\n", target_ns);
+
+	return target_ns;
+}
+
+/* Precision wait until target_time_nsec, combo of hrtimer + busy-wait for last msec. */
+static void exp_precision_wait_until(uint64_t target_time_nsec)
+{
+	ktime_t exp;
+
+	if (target_time_nsec < NSEC_PER_MSEC || target_time_nsec <= ktime_get_ns())
+		return;
+
+	exp = ns_to_ktime(target_time_nsec - NSEC_PER_MSEC);
+	for (; ktime_before(ktime_get(), exp);) {
+		__set_current_state(TASK_UNINTERRUPTIBLE);
+		if (!schedule_hrtimeout(&exp, HRTIMER_MODE_ABS))
+			break;
+	}
+
+	while (ktime_get_ns() < target_time_nsec)
+		udelay(1);
+
+	target_time_nsec = ktime_get_ns() - target_time_nsec;
+	if (target_time_nsec > 10 * NSEC_PER_USEC)
+		DRM_INFO("Flip target submit - Wait error usec: %d\n",
+			 (uint32_t) target_time_nsec / 1000);
+}
+
+/*
+ * This is the experimental new variant of update_freesync_state_on_stream().
+ * It only really differs from update_freesync_state_on_stream() in the
+ * if (surface) {} branch, preceeding and succeeding code is identical.
+ * Just kept as a separate copy to make experiments and rebasing more easy.
+ */
+static void exp_update_freesync_state_on_stream(
+	struct amdgpu_display_manager *dm,
+	struct dm_crtc_state *new_crtc_state,
+	struct dc_stream_state *new_stream,
+	struct dc_plane_state *surface,
+	u64 *target_time_nsec)
+{
+	/* Original: */
+	struct mod_vrr_params vrr_params;
+	struct dc_info_packet vrr_infopacket = {0};
+	struct amdgpu_device *adev = dm->adev;
+	struct amdgpu_crtc *acrtc = to_amdgpu_crtc(new_crtc_state->base.crtc);
+	unsigned long flags;
+	bool pack_sdp_v1_3 = false;
+
+	/* Experimental defines: TODO Some of the uint32_t should be uint64_t --> overflow for > 4 seconds otherwise! */
+	struct drm_crtc *crtc = new_crtc_state->base.crtc;
+	ktime_t vblank_time_t;
+	uint64_t vblank_time_ns, now_time_ns;
+	uint32_t us_until_flip, us_elapsed_in_frame;
+	uint32_t min_framedur_ns;
+	uint32_t max_framedur_ns;
+	uint32_t btr_threshold_ns;
+	uint32_t min_dur_us_backup;
+	uint32_t max_dur_us_backup;
+	uint32_t margin_old;
+	uint32_t last_used_vtotal;
+	uint32_t vrr_case;
+	uint32_t safety_ns = 200 * NSEC_PER_USEC; /* FIXME: Vsync+Backporch duration. Hard-code to 200 usecs for 185 usecs at 2560x1440@144 Hz. */
+	uint32_t vrr_flags = (adev->family >= AMDGPU_FAMILY_AI) ? 1 : 0; /* vrr_flags 1 needs gpu where DRR double buffering can be disabled */
+
+	/* Original code follows: */
+
+	if (!new_stream)
+		return;
+
+	/*
+	* TODO: Determine why min/max totals and vrefresh can be 0 here.
+	* For now it's sufficient to just guard against these conditions.
+	*/
+
+	if (!new_stream->timing.h_total || !new_stream->timing.v_total)
+		return;
+
+	spin_lock_irqsave(&adev_to_drm(adev)->event_lock, flags);
+	vrr_params = acrtc->dm_irq_params.vrr_params;
+
+	/* Experimental code starts here: */
+
+	/* Store target flip presentation onset time for irq handlers. */
+	acrtc->target_flip_onset = (s64) *target_time_nsec;
+
+	min_framedur_ns = vrr_params.min_duration_in_us * NSEC_PER_USEC;
+	max_framedur_ns = vrr_params.max_duration_in_us * NSEC_PER_USEC;
+
+	/*
+	 * Set transition point from vrr range to btr at 8/10th of max vrr range for
+	 * old-style max vrr range + wait. For new-style 2 we use the full vrr range
+	 * as threshold.
+	 */
+	btr_threshold_ns = ((max_framedur_ns - min_framedur_ns) * 8) / 10;
+	btr_threshold_ns= vrr_flags ? max_framedur_ns : min_framedur_ns + btr_threshold_ns;
+
+	/*
+	 * Time of most recent timestamped vblank. This is the start time of the
+	 * current frame, ie. active scanout. It will jump into the future, once
+	 * the end of front porch of this cycle is reached and we are in the vsync
+	 * or back porch area leading to the next - upcoming - frame. Well, it will
+	 * only jump, once a vupdate_irq handler will trigger the update...
+	 */
+	drm_crtc_vblank_count_and_time(crtc, &vblank_time_t);
+	vblank_time_ns = ktime_to_ns(vblank_time_t);
+	now_time_ns = ktime_get_ns();
+
+	if (vblank_time_ns > *target_time_nsec && *target_time_nsec > now_time_ns)
+		DRM_INFO("Flip target - Last vblank in the future wrt. target: %lld nsecs\n", vblank_time_ns - *target_time_nsec);
+
+	/*
+	 * target_time_nsec in the past, too close to now, or before earliest
+	 * possible end of current or upcoming vblank?
+	 */
+	if ((*target_time_nsec <= vblank_time_ns + min_framedur_ns) ||
+	    (*target_time_nsec <= now_time_ns + safety_ns)) {
+		/* Not far enough in the future to hit it anymore. Go to max VRR
+		 * range and submit hw flip asap / immediately, to maximize chance
+		 * of still hitting next active scanout cycle and minimize lateness
+		 * of display onset.
+		 */
+		vrr_case = 1;
+
+		/* Disable btr, go to max vrr range. */
+		us_until_flip = 0;
+
+		/* Set target time to zero, no wait happens and flip is programmed immediately. */
+		*target_time_nsec = 0;
+	}
+	else if (*target_time_nsec <= vblank_time_ns + btr_threshold_ns) {
+		/* In the next refresh cycle after current active one, and within
+		 * reach of the maximum vrr range. Program for max vrr range and
+		 * do a wait before flip programming untill almost target time.
+		 */
+		vrr_case = 2;
+
+		if (vrr_flags) {
+			/* Enable btr with one fixed duration filler frame for *target_time_nsec */
+			us_until_flip = ktime_to_us(ns_to_ktime(*target_time_nsec - vblank_time_ns));
+		}
+		else {
+			/* Disable btr, go to max vrr range. */
+			us_until_flip = 0;
+		}
+
+		/* Set target time to a bit before true target, to take fixed vsync+back porch
+		 * into account.
+		 */
+		*target_time_nsec -= safety_ns;
+	}
+	else {
+		/* More than safe max vrr duration btr_threshold_ns in the future, so
+		 * can't be catched without adding lfc filler frames of proper
+		 * duration. Try to compute proper config for btr.
+		 */
+		vrr_case = 3;
+
+		/* Enable btr with fixed duration filler frame insertion for *target_time_nsec */
+		us_until_flip = ktime_to_us(ns_to_ktime(*target_time_nsec - vblank_time_ns));
+
+		/* Set target time to a bit before true target, to take fixed vsync+back porch
+		 * into account.
+		 */
+		*target_time_nsec -= safety_ns;
+	}
+
+	if (surface) {
+		/* Set margin_in_us and prev_update_time_in_us so they don't interfere
+		 * with our special (ab-)use of mod_freesync_handle_preflip and its
+		 * internal call to apply_below_the_range(). The margin of zero will
+		 * prevent application of hysteresis in apply_below_the_range(), which
+		 * is useful for regular lfc, but not for us. prev_update_time_in_us = 0
+		 * makes sure that us_until_flip is passed through to apply_below_the_range()
+		 * "as is" - as an absolute time delta from "last flip" aka vblank_time_ns
+		 * reference point.
+		 */
+		margin_old = vrr_params.btr.margin_in_us;
+		vrr_params.btr.margin_in_us = 0;
+		surface->time.prev_update_time_in_us = 0;
+
+		min_dur_us_backup = vrr_params.min_duration_in_us;
+		max_dur_us_backup = vrr_params.max_duration_in_us;
+
+		if (vrr_flags && us_until_flip > 0 && vrr_params.btr.frames_to_insert > 0) {
+			/* Undo vrr_params.btr.frames_to_insert++ from previous cycle. */
+			vrr_params.btr.frames_to_insert--;
+		}
+
+		/* Fixed frame insertion in vrr range allowed and in case 2? */
+		if (vrr_flags && us_until_flip > 0 && vrr_case == 2) {
+			/* Hack: Override settings, so apply_below_the_range does its thing,
+			 * instead of disabling btr.
+			 */
+			vrr_params.btr.frames_to_insert = 0;
+			vrr_params.max_duration_in_us = 0;
+		}
+
+		DRM_INFO("Flip target - Case %d, wait until %lld usecs, set btr for %d usecs. Headroom %lld nsecs.\n",
+			 vrr_case, ktime_to_us(ns_to_ktime(*target_time_nsec)), us_until_flip,
+			 *target_time_nsec - now_time_ns);
+
+		/*
+		 * Tell the optimizer to never select a inserted_duration_in_us smaller than the one that corresponds
+		 * to the current point in time in this refresh cycle + 250 usecs headroom. This should help prevent
+		 * programming a v_total_max into the hw which is lower than the current scanout position at the current
+		 * time in the current refresh cyce. Why? Because doing so is bad! It will trigger an immediate end of
+		 * front-porch and reset to vsync_start, which will totally mess up our timing -- ending with an insertion
+		 * sequence shorter or longer than the target time.
+		 *
+		 * This should work at least in the min_framedur_ns to max_framedur_ns case #2, as the optimizer can
+		 * always pick frames_to_insert = 1 as a solution that always works if we made it into case #2.
+		 *
+		 * Case #3 should be safe as in controlled degradation, but i haven't verified yet that apply_below_the_range
+		 * can always find a good solution for this case.
+		 */
+		us_elapsed_in_frame = ktime_to_us(ns_to_ktime(ktime_get_ns() - vblank_time_ns)) + 250;
+		if (vrr_flags && us_until_flip > 0 && (min_dur_us_backup < us_elapsed_in_frame)) {
+			if (vrr_case == 2) {
+				/* Target time in active scanout cycle. Safe to set fixed duration via VRR? */
+				if (us_elapsed_in_frame > us_until_flip) {
+					/* Disable btr, go to max vrr range. */
+					DRM_INFO("Flip target - %d usecs over limit for safe VRR programming. Max VRR!\n",
+						 us_elapsed_in_frame - us_until_flip);
+					us_until_flip = 0;
+					vrr_params.max_duration_in_us = max_dur_us_backup;
+				}
+				else {
+					DRM_INFO("Flip target - Adjusting mindur to %d for safe VRR programming.\n",
+						 us_elapsed_in_frame);
+					vrr_params.min_duration_in_us = us_elapsed_in_frame;
+				}
+			}
+			else {
+				/* Case 3: Target time after current cycle at max duration and already in fp of current refresh. */
+				if (us_until_flip >= max_dur_us_backup + min_dur_us_backup) {
+					/* Defer frame insertion start to vupdate after end of this fp. */
+					vrr_case = 4;
+					us_until_flip -= max_dur_us_backup;
+					vrr_params.btr.frames_to_insert = 0;
+					vrr_params.max_duration_in_us = 0;
+
+					/* Avoid divide by zero in apply_below_the_range() ! */
+					if (us_until_flip == 0)
+						us_until_flip = 1;
+
+					DRM_INFO("Flip target - New case 3 to 4: Deferring VRR prog to future vupdate_irq, set new btr to %d usecs.\n",
+						 us_until_flip);
+				}
+				else {
+					/*
+					 * Cut it short or defer to next vupdate_irq if we can't insert more than 1 filler frame
+					 * at the current time with us_elapsed_in_frame already gone.
+					 */
+					if (2 * us_elapsed_in_frame > us_until_flip) {
+						/* Can't fit two filler frames of at least us_elapsed_in_frame minimum duration,
+						 * and one filler frame of us_until_flip would be too long in case 3.
+						 * Cut this frame short at duration us_elapsed_in_frame
+						 */
+						DRM_INFO("Flip target - New case 3 to 5: Cutting frame short to %d usecs.\n", us_elapsed_in_frame);
+
+						vrr_params.btr.btr_active = true;
+						vrr_params.btr.frames_to_insert = 2;
+						vrr_params.btr.frame_counter = 2;
+						vrr_params.btr.inserted_duration_in_us = us_elapsed_in_frame;
+
+						mod_freesync_handle_v_update(dm->freesync_module,
+										new_stream, &vrr_params);
+
+						exp_scanout_in_frontporch(acrtc, &vrr_params);
+						dc_stream_adjust_vmin_vmax(dm->dc,
+									    new_crtc_state->stream,
+									    &vrr_params.adjust);
+
+						/* Wait until frame finished / in back porch */
+						while (exp_scanout_in_frontporch(acrtc, &vrr_params))
+							udelay(1);
+
+						if (dc_stream_get_last_used_drr_vtotal(dm->dc, new_crtc_state->stream, &last_used_vtotal))
+							DRM_INFO("Flip target - New case 3 to 5: Last used drr vtotal %d\n", last_used_vtotal);
+
+						/* Now prepare frame insertion sequence starting at next vupdate_irq, ie.
+						 * after end of front porch of this refresh cycle.
+						 */
+						if (us_elapsed_in_frame + min_dur_us_backup <= us_until_flip) {
+							/* "Dead zone" of new refresh cycle moved closer to current time,
+							 * and out of the way. Should be able to hit target_time_nsec. */
+							vrr_case = 5;
+							us_until_flip -= us_elapsed_in_frame;
+
+							/* Avoid divide by zero in apply_below_the_range() */
+							if (us_until_flip <= 0)
+								us_until_flip = 1;
+
+							vrr_params.max_duration_in_us = 0;
+
+							DRM_INFO("Flip target - New case 3 to %d: Deferring VRR prog to future vupdate_irq, set new btr to %d usecs.\n",
+								 vrr_case, us_until_flip);
+						}
+						else {
+							/* Insufficient wiggle room, we were too close to end of front porch when we cut
+							 * the frame short. We will likely miss the target_time_nsec, but at least fail
+							 * into the right direction, instead of presenting too early.
+							 */
+							vrr_case = 3;
+							us_until_flip = 0;
+							vrr_params.max_duration_in_us = max_dur_us_backup;
+							DRM_INFO("Flip target - New case 3 to %d: Frame cut short, max VRR, set new btr to %d usecs. Expect deadline miss!\n",
+								 vrr_case, us_until_flip);
+						}
+
+						vrr_params.btr.frames_to_insert = 0;
+					}
+					else {
+						DRM_INFO("Flip target - Stay case 3 but adjusting mindur to %d for safe VRR programming.\n",
+							 us_elapsed_in_frame);
+						vrr_params.min_duration_in_us = us_elapsed_in_frame;
+					}
+				}
+			}
+
+			/* Clamp to safe maximum. */
+			if (vrr_params.min_duration_in_us > max_dur_us_backup) {
+				DRM_INFO("Flip target - Mindur %d out of range, clamp to %d !!!\n",
+					 vrr_params.min_duration_in_us, max_dur_us_backup);
+
+				vrr_params.min_duration_in_us = max_dur_us_backup;
+			}
+		}
+
+		mod_freesync_handle_preflip(
+			dm->freesync_module,
+			surface,
+			new_stream,
+			us_until_flip,
+			&vrr_params);
+
+		vrr_params.btr.margin_in_us = margin_old;
+		vrr_params.min_duration_in_us = min_dur_us_backup;
+		vrr_params.max_duration_in_us = max_dur_us_backup;
+
+		if (vrr_flags && us_until_flip > 0) {
+			vrr_params.btr.frames_to_insert++;
+			vrr_params.btr.frame_counter = vrr_params.btr.frames_to_insert;
+
+			/* Try to hw program the flip as early as possible for max headroom. */
+			*target_time_nsec += safety_ns;
+			*target_time_nsec -= ((vrr_params.btr.inserted_duration_in_us * 3) / 4) * NSEC_PER_USEC;
+		}
+
+		if (amdgpu_dm_vrr_active(new_crtc_state)) {
+			if (vrr_case != 4 && vrr_case != 5)
+				mod_freesync_handle_v_update(dm->freesync_module,
+							     new_stream, &vrr_params);
+
+			/* Need to call this before the frame ends. */
+			exp_scanout_in_frontporch(acrtc, &vrr_params);
+			dc_stream_adjust_vmin_vmax(dm->dc,
+						   new_crtc_state->stream,
+						   &vrr_params.adjust);
+			exp_scanout_in_frontporch(acrtc, &vrr_params);
+
+			if (dc_stream_get_last_used_drr_vtotal(dm->dc, new_crtc_state->stream, &last_used_vtotal))
+				DRM_INFO("Flip target - Setup: Last used drr vtotal %d\n", last_used_vtotal);
+		}
+	}
+
+	/* Original code from here on: */
+	mod_freesync_build_vrr_infopacket(
+		dm->freesync_module,
+		new_stream,
+		&vrr_params,
+		PACKET_TYPE_VRR,
+		TRANSFER_FUNC_UNKNOWN,
+		&vrr_infopacket,
+		pack_sdp_v1_3);
+
+	new_crtc_state->freesync_timing_changed |=
+		(memcmp(&acrtc->dm_irq_params.vrr_params.adjust,
+			&vrr_params.adjust,
+			sizeof(vrr_params.adjust)) != 0);
+
+	new_crtc_state->freesync_vrr_info_changed |=
+		(memcmp(&new_crtc_state->vrr_infopacket,
+			&vrr_infopacket,
+			sizeof(vrr_infopacket)) != 0);
+
+	acrtc->dm_irq_params.vrr_params = vrr_params;
+	new_crtc_state->vrr_infopacket = vrr_infopacket;
+
+	new_stream->adjust = acrtc->dm_irq_params.vrr_params.adjust;
+	new_stream->vrr_infopacket = vrr_infopacket;
+
+	if (new_crtc_state->freesync_vrr_info_changed)
+		DRM_DEBUG_KMS("VRR packet update: crtc=%u enabled=%d state=%d",
+			      new_crtc_state->base.crtc->base.id,
+			      (int)new_crtc_state->base.vrr_enabled,
+			      (int)vrr_params.state);
+
+	spin_unlock_irqrestore(&adev_to_drm(adev)->event_lock, flags);
+}
+
 static void amdgpu_dm_commit_cursors(struct drm_atomic_state *state)
 {
 	struct drm_plane *plane;
@@ -8424,6 +8918,8 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
 	unsigned long flags;
 	struct amdgpu_bo *abo;
 	uint32_t target_vblank, last_flip_vblank;
+	uint64_t now_time_ns;
+	uint64_t target_time_nsec = exp_get_target_time(&new_pcrtc_state->target_time_nsec);
 	bool vrr_active = amdgpu_dm_vrr_active(acrtc_state);
 	bool pflip_present = false;
 	struct {
@@ -8539,13 +9035,27 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
 			continue;
 		}
 
-		if (plane == pcrtc->primary)
-			update_freesync_state_on_stream(
-				dm,
-				acrtc_state,
-				acrtc_state->stream,
-				dc_plane,
-				bundle->flip_addrs[planes_count].flip_timestamp_in_us);
+		if (plane == pcrtc->primary) {
+			/* Give proper target_time_nsec to freesync setup. */
+			if (target_time_nsec != 0 && pflip_present && vrr_active) {
+				/* Experimental path: */
+				exp_update_freesync_state_on_stream(
+					dm,
+					acrtc_state,
+					acrtc_state->stream,
+					dc_plane,
+					&target_time_nsec);
+			}
+			else {
+				/* Classic path, like upstream: */
+				update_freesync_state_on_stream(
+					dm,
+					acrtc_state,
+					acrtc_state->stream,
+					dc_plane,
+					bundle->flip_addrs[planes_count].flip_timestamp_in_us);
+			}
+		}
 
 		DRM_DEBUG_ATOMIC("%s Flipping to hi: 0x%x, low: 0x%x\n",
 				 __func__,
@@ -8662,7 +9172,20 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
 				&acrtc_attach->dm_irq_params.vrr_params.adjust);
 			spin_unlock_irqrestore(&pcrtc->dev->event_lock, flags);
 		}
+
+		/* Wait with flip hw submission until target_time_nsec. */
+		exp_precision_wait_until(target_time_nsec);
+
+		now_time_ns = ktime_get_ns();
+
 		mutex_lock(&dm->dc_lock);
+
+		if (vrr_active && target_time_nsec && (ktime_get_ns() - now_time_ns > 10 * NSEC_PER_USEC))
+			DRM_INFO("Flip target submit - mutex_lock() wait took usec: %d\n",
+				 (uint32_t) (ktime_get_ns() - now_time_ns) / 1000);
+
+		now_time_ns = ktime_get_ns();
+
 		if ((acrtc_state->update_type > UPDATE_TYPE_FAST) &&
 				acrtc_state->stream->link->psr_settings.psr_allow_active)
 			amdgpu_dm_psr_disable(acrtc_state->stream);
@@ -8673,6 +9196,10 @@ static void amdgpu_dm_commit_planes(struct drm_atomic_state *state,
 						     acrtc_state->stream,
 						     &bundle->stream_update,
 						     dc_state);
+
+		if (vrr_active && target_time_nsec)
+			DRM_INFO("Flip target submit - Flip at %lld commit took usec: %d\n", ktime_get_ns(),
+				 (uint32_t) (ktime_get_ns() - now_time_ns) / 1000);
 
 		/**
 		 * Enable or disable the interrupts on the backend.

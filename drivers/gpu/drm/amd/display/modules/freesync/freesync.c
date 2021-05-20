@@ -1222,6 +1222,16 @@ void mod_freesync_handle_v_update(struct mod_freesync *mod_freesync,
 				mod_freesync_calc_v_total_from_refresh(stream,
 				in_out_vrr->min_refresh_in_uhz);
 		}
+
+		DRM_INFO("Flip target - FrameToGo %d - Mode will be %s after time %lld - Insert %d us.\n",
+			 in_out_vrr->btr.frame_counter,
+			 (in_out_vrr->adjust.v_total_max == in_out_vrr->adjust.v_total_min) ? "INSERT" : "RANGE ",
+			 ktime_get_ns(), in_out_vrr->btr.inserted_duration_in_us);
+	}
+	else {
+		DRM_INFO("Flip target - BTR off - Mode will be %s after time %lld\n",
+		(in_out_vrr->adjust.v_total_max == in_out_vrr->adjust.v_total_min) ? "INSERT" : "RANGE ",
+		ktime_get_ns());
 	}
 
 	/* If in fullscreen freesync mode or in video, do not program

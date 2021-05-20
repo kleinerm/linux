@@ -1431,7 +1431,7 @@ void optc1_clear_optc_underflow(struct timing_generator *optc)
 void optc1_tg_init(struct timing_generator *optc)
 {
 	optc1_set_blank_data_double_buffer(optc, true);
-	optc1_set_timing_double_buffer(optc, true);
+	optc1_set_timing_double_buffer(optc, false);
 	optc1_clear_optc_underflow(optc);
 }
 

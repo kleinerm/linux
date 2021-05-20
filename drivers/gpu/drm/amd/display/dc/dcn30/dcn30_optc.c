@@ -279,7 +279,7 @@ static void optc3_set_timing_double_buffer(struct timing_generator *optc, bool e
 
 void optc3_tg_init(struct timing_generator *optc)
 {
-	optc3_set_timing_double_buffer(optc, true);
+	optc3_set_timing_double_buffer(optc, false);
 	optc1_clear_optc_underflow(optc);
 }
 
