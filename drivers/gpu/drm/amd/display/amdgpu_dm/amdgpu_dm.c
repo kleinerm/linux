@@ -10672,6 +10672,11 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
 			edid_check_required = is_dp_capable_without_timing_msa(
 						adev->dm.dc,
 						amdgpu_dm_connector);
+
+			if (!edid_check_required) {
+				edid_check_required = true;
+				DRM_INFO("DP without timing MSA dpcd -> Force vrr.\n");
+			}
 		}
 
 		if (edid_check_required == true && (edid->version > 1 ||
@@ -10703,6 +10708,10 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
 				connector->display_info.monitor_range.min_vfreq = range->min_vfreq;
 				connector->display_info.monitor_range.max_vfreq = range->max_vfreq;
 
+				DRM_INFO("DP EDID vrr %d: %d - %d Hz, clock %d Mhz\n", i,
+					  amdgpu_dm_connector->min_vfreq, amdgpu_dm_connector->max_vfreq,
+					  amdgpu_dm_connector->pixel_clock_mhz);
+
 				break;
 			}
 
@@ -10714,6 +10723,7 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
 		}
 	} else if (edid && amdgpu_dm_connector->dc_sink->sink_signal == SIGNAL_TYPE_HDMI_TYPE_A) {
 		i = parse_hdmi_amd_vsdb(amdgpu_dm_connector, edid, &vsdb_info);
+		DRM_INFO("HDMI EDID vrr %d: FSs %d: %d - %d Hz\n", i, vsdb_info.freesync_supported, vsdb_info.min_refresh_rate_hz, vsdb_info.max_refresh_rate_hz);
 		if (i >= 0 && vsdb_info.freesync_supported) {
 			timing  = &edid->detailed_timings[i];
 			data    = &timing->data.other_data;
@@ -10726,6 +10736,17 @@ void amdgpu_dm_update_freesync_caps(struct drm_connector *connector,
 			connector->display_info.monitor_range.min_vfreq = vsdb_info.min_refresh_rate_hz;
 			connector->display_info.monitor_range.max_vfreq = vsdb_info.max_refresh_rate_hz;
 		}
+	}
+
+	if (!freesync_capable) {
+		bool is_hdmi = amdgpu_dm_connector->dc_sink->sink_signal == SIGNAL_TYPE_HDMI_TYPE_A;
+		amdgpu_dm_connector->min_vfreq = (!is_hdmi) ? 30 : 48;
+		amdgpu_dm_connector->max_vfreq = (!is_hdmi) ? 144 : 100;
+		amdgpu_dm_connector->pixel_clock_mhz = (!is_hdmi) ? 590 : 0;
+		connector->display_info.monitor_range.min_vfreq = amdgpu_dm_connector->min_vfreq;
+		connector->display_info.monitor_range.max_vfreq = amdgpu_dm_connector->max_vfreq;
+		freesync_capable = true;
+		DRM_INFO("fake vrr: %d - %d Hz, clock %d Mhz\n", amdgpu_dm_connector->min_vfreq, amdgpu_dm_connector->max_vfreq, amdgpu_dm_connector->pixel_clock_mhz);
 	}
 
 update:
