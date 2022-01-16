@@ -396,6 +396,10 @@ amdgpu_dma_buf_create_obj(struct drm_device *dev, struct dma_buf *dma_buf)
 
 		flags |= other->flags & AMDGPU_GEM_CREATE_CPU_GTT_USWC;
 	}
+	else {
+		/* Non-AMD gpu for import. Assume USWC - always an optimist! */
+		flags |= AMDGPU_GEM_CREATE_CPU_GTT_USWC;
+	}
 
 	ret = amdgpu_gem_object_create(adev, dma_buf->size, PAGE_SIZE,
 				       AMDGPU_GEM_DOMAIN_CPU, flags,
