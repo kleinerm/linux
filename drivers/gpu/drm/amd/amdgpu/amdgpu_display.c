@@ -496,7 +496,7 @@ uint32_t amdgpu_display_supported_domains(struct amdgpu_device *adev,
 					  uint64_t bo_flags)
 {
 	uint32_t domain = AMDGPU_GEM_DOMAIN_VRAM;
-
+	DRM_WARN_ONCE("AMD rev-id %d\n", adev->rev_id);
 #if defined(CONFIG_DRM_AMD_DC)
 	/*
 	 * if amdgpu_bo_support_uswc returns false it means that USWC mappings
@@ -516,7 +516,7 @@ uint32_t amdgpu_display_supported_domains(struct amdgpu_device *adev,
 			break;
 		case CHIP_RAVEN:
 			/* enable S/G on PCO and RV2 */
-			if ((adev->apu_flags & AMD_APU_IS_RAVEN2) ||
+			if ((adev->apu_flags & AMD_APU_IS_RAVEN2) || true ||
 			    (adev->apu_flags & AMD_APU_IS_PICASSO))
 				domain |= AMDGPU_GEM_DOMAIN_GTT;
 			break;
